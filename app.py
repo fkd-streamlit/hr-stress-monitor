@@ -171,7 +171,6 @@ RTC_CONFIGURATION = {
     ]
 }
 
-
 ctx = webrtc_streamer(
     key="stress",
     mode=WebRtcMode.SENDRECV,
@@ -179,7 +178,15 @@ ctx = webrtc_streamer(
     video_processor_factory=StressVideoProcessor,
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
+    video_html_attrs={
+        "autoPlay": True,
+        "controls": False,
+        "muted": True,      # ←重要（自動再生制約回避）
+        "playsInline": True # ←重要（iOS/一部環境）
+    },
 )
+
+
 
 st.markdown("### 🔎 WebRTC Diagnostic")
 if ctx and ctx.state:
