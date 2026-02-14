@@ -1,14 +1,13 @@
+import io
+import json
 import time
 from collections import deque
-import json
 
-import av
 import cv2
 import numpy as np
 import streamlit as st
 from scipy.signal import butter, filtfilt, find_peaks
 from scipy.fft import fft
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 
 
 # =============================
@@ -41,7 +40,6 @@ def compute_time_domain(rr):
 
 
 def compute_frequency_domain(rr, fs=4):
-    # rr: seconds between beats
     if len(rr) < 4:
         return 0.0, 0.0, 0.0
 
@@ -61,171 +59,143 @@ def compute_frequency_domain(rr, fs=4):
 
 
 def compute_stress_level(lf_hf, rmssd, hr):
-    # very simple heuristic (prototype)
     lf_norm = min(lf_hf / 4.0, 1.0)
     rmssd_norm = min(rmssd / 0.1, 1.0)
     hr_norm = min(max((hr - 60) / 60, 0), 1.0)
-
     score = 0.5 * lf_norm + 0.3 * (1 - rmssd_norm) + 0.2 * hr_norm
     level = int(score * 11) + 1
     return max(1, min(level, 12))
 
 
 # =============================
-# Video Processor
+# Video analysis
 # =============================
-class StressVideoProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.g_values = deque(maxlen=1500)  # a bit more buffer
-        self.t_values = deque(maxlen=1500)
+def analyze_video(file_bytes: bytes, window_sec=20, low=0.8, high=2.5, roi_mode="center"):
+    # OpenCV VideoCapture can read from a temp file. Streamlit gives bytes.
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tf:
+        tf.write(file_bytes)
+        tmp_path = tf.name
 
-        self.last_metrics = {
-            "hr": None,
-            "stress": None,
-            "lfhf": None,
-            "rmssd": None,
-            "sdnn": None,
-            "fs": None,
-            "rr_n": 0,
-        }
+    cap = cv2.VideoCapture(tmp_path)
+    if not cap.isOpened():
+        return None, "動画を読み込めませんでした（形式が非対応の可能性）"
 
-    def recv(self, frame: av.VideoFrame):
-        img = frame.to_ndarray(format="bgr24")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 1:
+        # fallback
+        fps = 30.0
 
-        now = time.time()
-        g_mean = float(np.mean(img[:, :, 1]))  # green mean
+    n_win = int(window_sec * fps)
 
-        self.g_values.append(g_mean)
-        self.t_values.append(now)
+    g = deque(maxlen=n_win)
+    ts = deque(maxlen=n_win)
 
-        # Estimate FPS
-        fs = 0.0
-        if len(self.t_values) > 20:
-            dt = self.t_values[-1] - self.t_values[0]
-            fs = (len(self.t_values) - 1) / dt if dt > 0 else 0.0
+    # Read frames
+    start_time = time.time()
+    frame_count = 0
 
-        if fs > 8:  # a bit stricter for stability
-            n_win = int(20 * fs)
-            if len(self.g_values) >= n_win:
-                sig = np.array(list(self.g_values)[-n_win:], dtype=np.float64)
-                filtered = bandpass_filter(sig, fs)
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_count += 1
 
-                # peak distance: at least 0.45s between peaks (~133 bpm max)
-                min_dist = max(int(fs * 0.45), 1)
-                peaks, _ = find_peaks(filtered, distance=min_dist)
-                rr = compute_rr_intervals(peaks, fs)
+        h, w = frame.shape[:2]
+        if roi_mode == "center":
+            # center ROI
+            x1, y1 = int(w*0.35), int(h*0.25)
+            x2, y2 = int(w*0.65), int(h*0.55)
+            roi = frame[y1:y2, x1:x2]
+        else:
+            roi = frame
 
-                if len(rr) >= 5 and 0.3 < np.mean(rr) < 1.5:
-                    hr = float(60.0 / np.mean(rr))
-                    sdnn, rmssd = compute_time_domain(rr)
-                    _, _, lfhf = compute_frequency_domain(rr)
-                    stress = compute_stress_level(lfhf, rmssd, hr)
+        g_mean = float(np.mean(roi[:, :, 1]))
+        g.append(g_mean)
+        ts.append(frame_count / fps)
 
-                    self.last_metrics.update({
-                        "hr": hr,
-                        "stress": int(stress),
-                        "lfhf": float(lfhf),
-                        "rmssd": float(rmssd),
-                        "sdnn": float(sdnn),
-                        "fs": float(fs),
-                        "rr_n": int(len(rr)),
-                    })
+    cap.release()
 
-        # Overlay
-        m = self.last_metrics
-        if m["stress"] is not None and m["hr"] is not None:
-            color = (0, int(max(0, 255 - m["stress"] * 20)), int(min(255, m["stress"] * 20)))
+    if len(g) < n_win:
+        return None, f"動画が短すぎます。{window_sec}秒以上の動画をアップしてください。"
 
-            cv2.putText(img, f"FPS(est): {m['fs']:.1f}",
-                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2)
+    sig = np.array(list(g), dtype=np.float64)
+    filtered = bandpass_filter(sig, fps, low=low, high=high)
 
-            cv2.putText(img, f"HR: {m['hr']:.1f} bpm (RR n={m['rr_n']})",
-                        (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
-                        (255, 255, 255), 2)
+    min_dist = max(int(fps * 0.45), 1)
+    peaks, _ = find_peaks(filtered, distance=min_dist)
 
-            cv2.putText(img, f"LF/HF: {m['lfhf']:.2f}  RMSSD: {m['rmssd']:.3f}",
-                        (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
-                        (255, 255, 255), 2)
+    rr = compute_rr_intervals(peaks, fps)
+    if len(rr) < 5 or not (0.3 < np.mean(rr) < 1.5):
+        return None, "脈波ピークが安定して検出できませんでした（明るさ/顔の動き/ROIを調整してください）"
 
-            cv2.putText(img, f"Stress Level: {m['stress']}/12",
-                        (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                        color, 3)
+    hr = float(60.0 / np.mean(rr))
+    sdnn, rmssd = compute_time_domain(rr)
+    _, _, lfhf = compute_frequency_domain(rr)
+    stress = int(compute_stress_level(lfhf, rmssd, hr))
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+    result = {
+        "hr_bpm": hr,
+        "stress_level_12": stress,
+        "lfhf": float(lfhf),
+        "rmssd": float(rmssd),
+        "sdnn": float(sdnn),
+        "fps_est": float(fps),
+        "rr_n": int(len(rr)),
+        "window_sec": int(window_sec),
+    }
+    return result, None
 
 
 # =============================
-# Streamlit UI
+# UI
 # =============================
-st.set_page_config(page_title="HR Stress Monitor", layout="wide")
-st.title("🫀 HR Stress Monitor")
+st.set_page_config(page_title="HR Stress Monitor (Upload)", layout="wide")
+st.title("🫀 HR Stress Monitor (Cloud-safe)")
 st.caption("※ 医療用途ではありません（research prototype）")
+st.info("Streamlit Cloud では WebRTC カメラが起動しない環境があるため、公開版は「動画アップロード解析」にしています。")
 
+with st.sidebar:
+    st.header("Settings")
+    window_sec = st.slider("解析ウィンドウ(秒)", 10, 40, 20, 1)
+    low = st.slider("Bandpass low (Hz)", 0.5, 1.5, 0.8, 0.05)
+    high = st.slider("Bandpass high (Hz)", 1.5, 3.5, 2.5, 0.05)
+    roi_mode = st.selectbox("ROI", ["center", "full"], index=0)
+    st.caption("コツ：明るい環境・顔を大きく・動かさない・20秒以上の動画")
 
-RTC_CONFIGURATION = {
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-        {"urls": ["stun:global.stun.twilio.com:3478"]},
-    ]
-}
+uploaded = st.file_uploader("顔が映った動画（mp4 推奨）をアップロード", type=["mp4", "mov", "m4v", "webm"])
 
-ctx = webrtc_streamer(
-    key="stress",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration=RTC_CONFIGURATION,
-    video_processor_factory=StressVideoProcessor,
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-    video_html_attrs={
-        "autoPlay": True,
-        "controls": False,
-        "muted": True,      # ←重要（自動再生制約回避）
-        "playsInline": True # ←重要（iOS/一部環境）
-    },
-)
+if uploaded:
+    st.video(uploaded)
 
+    if st.button("解析する"):
+        with st.spinner("解析中..."):
+            result, err = analyze_video(uploaded.getvalue(), window_sec=window_sec, low=low, high=high, roi_mode=roi_mode)
 
+        if err:
+            st.error(err)
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("HR", f"{result['hr_bpm']:.1f} bpm")
+            c2.metric("Stress", f"{result['stress_level_12']}/12")
+            c3.metric("LF/HF", f"{result['lfhf']:.2f}")
+            c4.metric("RMSSD", f"{result['rmssd']:.3f}")
 
-st.markdown("### 🔎 WebRTC Diagnostic")
-if ctx and ctx.state:
-    st.write("playing:", ctx.state.playing)
-    st.write("signaling_state:", getattr(ctx.state, "signaling_state", None))
-    st.write("ice_connection_state:", getattr(ctx.state, "ice_connection_state", None))
-    st.write("connection_state:", getattr(ctx.state, "connection_state", None))
+            qubo = {
+                "ts": time.time(),
+                "hr_bpm": float(result["hr_bpm"]),
+                "stress_level_12": int(result["stress_level_12"]),
+                "lfhf": float(result["lfhf"]),
+                "rmssd": float(result["rmssd"]),
+                "sdnn": float(result["sdnn"]),
+            }
+
+            st.download_button(
+                "⬇️ Download QUBO Input JSON",
+                data=json.dumps(qubo, ensure_ascii=False, indent=2),
+                file_name="qubo_input.json",
+                mime="application/json",
+            )
+
 else:
-    st.write("ctx.state is None (not initialized yet)")
-st.write("has video_processor:", bool(getattr(ctx, "video_processor", None)))
-
-
-st.markdown("---")
-
-# Safe guards (ctx can exist before media starts)
-if ctx and ctx.state and ctx.state.playing and ctx.video_processor:
-    m = ctx.video_processor.last_metrics
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("HR", "-" if m["hr"] is None else f"{m['hr']:.1f} bpm")
-    c2.metric("Stress", "-" if m["stress"] is None else f"{m['stress']}/12")
-    c3.metric("RR count", f"{m.get('rr_n', 0)}")
-
-    # Export only when fully ready
-    if m["hr"] is not None and m["stress"] is not None:
-        output = {
-            "ts": time.time(),
-            "hr_bpm": float(m["hr"]),
-            "stress_level_12": int(m["stress"]),
-            "lfhf": float(m["lfhf"]) if m["lfhf"] is not None else 0.0,
-            "rmssd": float(m["rmssd"]) if m["rmssd"] is not None else 0.0,
-            "sdnn": float(m["sdnn"]) if m["sdnn"] is not None else 0.0,
-        }
-
-        st.download_button(
-            "⬇️ Download QUBO Input JSON",
-            data=json.dumps(output, ensure_ascii=False, indent=2),
-            file_name="qubo_input.json",
-            mime="application/json",
-        )
-else:
-    st.info("▶ カメラを開始すると、HR / Stress が表示されます（明るい環境で、顔をなるべく動かさないのがコツ）。")
+    st.warning("まず動画ファイルをアップしてください。")
