@@ -1,0 +1,6 @@
+streamlit
+streamlit-webrtc
+opencv-python
+numpy
+scipy
+av
