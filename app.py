@@ -164,8 +164,13 @@ st.caption("※ 医療用途ではありません（research prototype）")
 
 
 RTC_CONFIGURATION = {
-    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:global.stun.twilio.com:3478"]},
+    ]
 }
+
 
 ctx = webrtc_streamer(
     key="stress",
@@ -175,6 +180,17 @@ ctx = webrtc_streamer(
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
 )
+
+st.markdown("### 🔎 WebRTC Diagnostic")
+if ctx and ctx.state:
+    st.write("playing:", ctx.state.playing)
+    st.write("signaling_state:", getattr(ctx.state, "signaling_state", None))
+    st.write("ice_connection_state:", getattr(ctx.state, "ice_connection_state", None))
+    st.write("connection_state:", getattr(ctx.state, "connection_state", None))
+else:
+    st.write("ctx.state is None (not initialized yet)")
+st.write("has video_processor:", bool(getattr(ctx, "video_processor", None)))
+
 
 st.markdown("---")
 
