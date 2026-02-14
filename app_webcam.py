@@ -82,60 +82,65 @@ class StressVideoProcessor(VideoProcessorBase):
         }
 
     def recv(self, frame: av.VideoFrame):
-        img = frame.to_ndarray(format="bgr24")
+        try:
+            img = frame.to_ndarray(format="bgr24")
 
-        now = time.time()
-        g_mean = float(np.mean(img[:, :, 1]))
+            now = time.time()
+            g_mean = float(np.mean(img[:, :, 1]))
 
-        self.g_values.append(g_mean)
-        self.t_values.append(now)
+            self.g_values.append(g_mean)
+            self.t_values.append(now)
 
-        if len(self.t_values) > 10:
-            dt = self.t_values[-1] - self.t_values[0]
-            fs = (len(self.t_values) - 1) / dt if dt > 0 else 0
-        else:
-            fs = 0
+            if len(self.t_values) > 10:
+                dt = self.t_values[-1] - self.t_values[0]
+                fs = (len(self.t_values) - 1) / dt if dt > 0 else 0
+            else:
+                fs = 0
 
-        if fs > 5:
-            n_win = int(20 * fs)
-            if len(self.g_values) >= n_win:
-                sig = np.array(list(self.g_values)[-n_win:], dtype=np.float32)
-                filtered = bandpass_filter(sig, fs)
+            if fs > 5:
+                n_win = int(20 * fs)
+                if len(self.g_values) >= n_win:
+                    sig = np.array(list(self.g_values)[-n_win:], dtype=np.float32)
+                    filtered = bandpass_filter(sig, fs)
 
-                peaks, _ = find_peaks(filtered, distance=max(int(fs / 2), 1))
-                rr = compute_rr_intervals(peaks, fs)
+                    peaks, _ = find_peaks(filtered, distance=max(int(fs / 2), 1))
+                    rr = compute_rr_intervals(peaks, fs)
 
-                if len(rr) > 3:
-                    hr = 60 / np.mean(rr)
-                    sdnn, rmssd = compute_time_domain(rr)
-                    _, _, lfhf = compute_frequency_domain(rr)
-                    stress = compute_stress_level(lfhf, rmssd, hr)
+                    if len(rr) > 3:
+                        hr = 60 / np.mean(rr)
+                        sdnn, rmssd = compute_time_domain(rr)
+                        _, _, lfhf = compute_frequency_domain(rr)
+                        stress = compute_stress_level(lfhf, rmssd, hr)
 
-                    self.last_metrics.update({
-                        "hr": float(hr),
-                        "stress": int(stress),
-                        "lfhf": float(lfhf),
-                        "rmssd": float(rmssd),
-                        "sdnn": float(sdnn),
-                        "fs": float(fs),
-                    })
+                        self.last_metrics.update({
+                            "hr": float(hr),
+                            "stress": int(stress),
+                            "lfhf": float(lfhf),
+                            "rmssd": float(rmssd),
+                            "sdnn": float(sdnn),
+                            "fs": float(fs),
+                        })
 
-        # overlay
-        m = self.last_metrics
-        if m["stress"] is not None:
-            color = (0, 255 - m["stress"] * 20, m["stress"] * 20)
+            # overlay
+            m = self.last_metrics
+            if m["stress"] is not None:
+                color = (0, 255 - m["stress"] * 20, m["stress"] * 20)
 
-            cv2.putText(img, f"HR: {m['hr']:.1f} bpm",
-                        (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                        (255, 255, 255), 2)
+                cv2.putText(img, f"HR: {m['hr']:.1f} bpm",
+                            (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                            (255, 255, 255), 2)
 
-            cv2.putText(img, f"Stress Level: {m['stress']}/12",
-                        (20, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                        color, 3)
+                cv2.putText(img, f"Stress Level: {m['stress']}/12",
+                            (20, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                            color, 3)
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+        except Exception as e:
+            # エラーが発生した場合もフレームを返す
+            st.error(f"Video processing error: {str(e)}")
+            return frame
 
 
 # =============================
@@ -145,7 +150,14 @@ st.set_page_config(page_title="HR Stress Monitor (Webcam)", layout="wide")
 st.title("🫀 HR Stress Monitor (Webcam)")
 st.caption("※ 医療用途ではありません（research prototype）")
 
-RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+# Streamlit Cloud用に複数のICEサーバーを設定
+RTC_CONFIGURATION = {
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+    ]
+}
 
 ctx = webrtc_streamer(
     key="stress",
@@ -182,3 +194,16 @@ if ctx.video_processor:
         )
 else:
     st.info("カメラを開始すると、HR / Stress が表示されます（明るい環境で、顔をなるべく動かさないのがコツ）。")
+    
+    st.markdown("### トラブルシューティング")
+    st.markdown("""
+    - **カメラが表示されない場合:**
+      1. ブラウザのカメラ権限を確認してください
+      2. HTTPS接続であることを確認してください（Streamlit Cloudは自動的にHTTPSです）
+      3. ブラウザを最新版に更新してください
+      4. 別のブラウザ（Chrome、Firefox、Edge）で試してください
+    
+    - **Streamlit Cloudで動作しない場合:**
+      1. `requirements.txt`に必要なパッケージが全て含まれているか確認してください
+      2. Streamlit Cloudのログを確認してエラーがないか確認してください
+    """)
